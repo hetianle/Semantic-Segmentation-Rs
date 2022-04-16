@@ -1,14 +1,17 @@
-# ------------------------------------------------------------------------------
-# Copyright (c) Microsoft
-# Licensed under the MIT License.
-# Written by Ke Sun (sunk@mail.ustc.edu.cn)
-# ------------------------------------------------------------------------------
 
+from ast import arg
+import sys
+import os
+
+from sklearn.utils import shuffle
+script_file = os.path.realpath(__file__)
+script_dir = os.path.dirname(script_file)
+sys.path.insert(0, f'{script_dir}/../')
 import argparse
 import os
 import pprint
 import shutil
-import sys
+
 
 import logging
 import time
@@ -22,44 +25,55 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.optim
 from torch.utils.data.distributed import DistributedSampler
+from torch import distributed as dist
+
 from tensorboardX import SummaryWriter
 
-import _init_paths
-import models
-import datasets
-from config import config
-from config import update_config
-from core.criterion import CrossEntropy, OhemCrossEntropy
-from core.function import train, validate
-from utils.modelsummary import get_model_summary
-from utils.utils import create_logger, FullModel, get_rank
+from lib.models import UNet
+from lib.datasets.base_dataset import BaseDataset
+from lib.datasets.pipelines.transforms import LoadingFile,RandomCrop
+
+from lib.core.criterion import CrossEntropy, OhemCrossEntropy
+from lib.core.function import train
+from lib.utils.modelsummary import get_model_summary
+from lib.utils.utils import create_logger, FullModel, get_rank
+
+from yacs.config import CfgNode
+
+import yaml
+
+from mmcv.cnn.utils import revert_sync_batchnorm
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train segmentation network')
     
     parser.add_argument('--cfg',
                         help='experiment configure file name',
-                        required=True,
+                        default='/mnt/lustrenew2/hetianle/IGSNRR/light_project/Semantic-Segmentation-Rs/experiments/loveda/seg_unet_2048x2048_sgd_lr1e-2_wd5e-4_bs_12_epoch484.yaml',
                         type=str)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument('opts',
                         help="Modify config options using the command-line",
                         default=None,
                         nargs=argparse.REMAINDER)
+    parser.add_argument("--launcher",default=None)
 
     args = parser.parse_args()
-    update_config(config, args)
+   
 
     return args
 
 def main():
     args = parse_args()
+    config = CfgNode.load_cfg(open(args.cfg))
 
     logger, final_output_dir, tb_log_dir = create_logger(
         config, args.cfg, 'train')
 
-    logger.info(pprint.pformat(args))
-    logger.info(config)
+    if args.local_rank == 0:
+        logger.info(pprint.pformat(args))
+        logger.info(config)
 
     writer_dict = {
         'writer': SummaryWriter(tb_log_dir),
@@ -68,136 +82,104 @@ def main():
     }
 
     # cudnn related setting
-    cudnn.benchmark = config.CUDNN.BENCHMARK
-    cudnn.deterministic = config.CUDNN.DETERMINISTIC
-    cudnn.enabled = config.CUDNN.ENABLED
-    gpus = list(config.GPUS)
-    distributed = len(gpus) > 1
+    cudnn.benchmark = True
+    cudnn.deterministic = False
+    cudnn.enabled = True
+    
+
     device = torch.device('cuda:{}'.format(args.local_rank))
 
     # build model
-    model = eval('models.'+config.MODEL.NAME +
-                 '.get_seg_model')(config)
+
+    model = UNet(3,8)
+
+    if args.launcher == 'pytorch':
+        distributed = True
+    else: 
+        distributed = False
+
 
     if args.local_rank == 0:
         # provide the summary of model
         dump_input = torch.rand(
-            (1, 3, config.TRAIN.IMAGE_SIZE[1], config.TRAIN.IMAGE_SIZE[0])
+            (1, 3, 512 , 512)
             )
         logger.info(get_model_summary(model.to(device), dump_input.to(device)))
-
-        # copy model file
-        this_dir = os.path.dirname(__file__)
-        models_dst_dir = os.path.join(final_output_dir, 'models')
-        if os.path.exists(models_dst_dir):
-            shutil.rmtree(models_dst_dir)
-        shutil.copytree(os.path.join(this_dir, '../lib/models'), models_dst_dir)
+        logger.info(f"Distribted : {distributed}")
 
     if distributed:
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(
-            backend="nccl", init_method="env://",
-        )
+            backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        gpus =  range(world_size)
+    else:
+        model = revert_sync_batchnorm(model)
+        gpus = [0]
 
     # prepare data
-    crop_size = (config.TRAIN.IMAGE_SIZE[1], config.TRAIN.IMAGE_SIZE[0])
-    train_dataset = eval('datasets.'+config.DATASET.DATASET)(
-                        root=config.DATASET.ROOT,
-                        list_path=config.DATASET.TRAIN_SET,
-                        num_samples=None,
-                        num_classes=config.DATASET.NUM_CLASSES,
-                        multi_scale=config.TRAIN.MULTI_SCALE,
-                        flip=config.TRAIN.FLIP,
-                        ignore_label=config.TRAIN.IGNORE_LABEL,
-                        base_size=config.TRAIN.BASE_SIZE,
-                        crop_size=crop_size,
-                        downsample_rate=config.TRAIN.DOWNSAMPLERATE,
-                        scale_factor=config.TRAIN.SCALE_FACTOR)
+
+    if isinstance(config.DATASET,(list,tuple)):
+        if args.local_rank==0:
+            print(config.DATASET)
+
+
+        datasetlist = [BaseDataset(
+            img_dir= ds["IMG_DIR"],
+            label_dir= ds["LABEL_DIR"],
+            pipelines=  ds["PIPELINE"]) for ds in config.DATASET]
+
+        train_dataset = torch.utils.data.dataset.ConcatDataset(datasetlist)
+
+    else:
+        train_dataset = BaseDataset(
+            img_dir= config.DATASET.IMG_DIR,
+            label_dir= config.DATASET.LABEL_DIR,
+            pipelines=  config.DATASET.PIPELINE
+        )
+
+
+    if args.local_rank == 0:
+        logger.info(f"Loading {len(train_dataset)} samples.")
 
     if distributed:
         train_sampler = DistributedSampler(train_dataset)
     else:
         train_sampler = None
 
-    trainloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config.TRAIN.BATCH_SIZE_PER_GPU,
-        shuffle=config.TRAIN.SHUFFLE and train_sampler is None,
-        num_workers=config.WORKERS,
-        pin_memory=True,
-        drop_last=True,
-        sampler=train_sampler)
-
-    if config.DATASET.EXTRA_TRAIN_SET:
-        extra_train_dataset = eval('datasets.'+config.DATASET.DATASET)(
-                    root=config.DATASET.ROOT,
-                    list_path=config.DATASET.EXTRA_TRAIN_SET,
-                    num_samples=None,
-                    num_classes=config.DATASET.NUM_CLASSES,
-                    multi_scale=config.TRAIN.MULTI_SCALE,
-                    flip=config.TRAIN.FLIP,
-                    ignore_label=config.TRAIN.IGNORE_LABEL,
-                    base_size=config.TRAIN.BASE_SIZE,
-                    crop_size=crop_size,
-                    downsample_rate=config.TRAIN.DOWNSAMPLERATE,
-                    scale_factor=config.TRAIN.SCALE_FACTOR)
-
-        if distributed:
-            extra_train_sampler = DistributedSampler(extra_train_dataset)
-        else:
-            extra_train_sampler = None
-
-        extra_trainloader = torch.utils.data.DataLoader(
-            extra_train_dataset,
+    if distributed:
+        trainloader = torch.utils.data.DataLoader(
+            train_dataset,
             batch_size=config.TRAIN.BATCH_SIZE_PER_GPU,
-            shuffle=config.TRAIN.SHUFFLE and extra_train_sampler is None,
-            num_workers=config.WORKERS,
+            num_workers=config.TRAIN.WORKERS_PER_GPU,
             pin_memory=True,
             drop_last=True,
-            sampler=extra_train_sampler)
-
-    test_size = (config.TEST.IMAGE_SIZE[1], config.TEST.IMAGE_SIZE[0])
-    test_dataset = eval('datasets.'+config.DATASET.DATASET)(
-                        root=config.DATASET.ROOT,
-                        list_path=config.DATASET.TEST_SET,
-                        num_samples=config.TEST.NUM_SAMPLES,
-                        num_classes=config.DATASET.NUM_CLASSES,
-                        multi_scale=False,
-                        flip=False,
-                        ignore_label=config.TRAIN.IGNORE_LABEL,
-                        base_size=config.TEST.BASE_SIZE,
-                        crop_size=test_size,
-                        center_crop_test=config.TEST.CENTER_CROP_TEST,
-                        downsample_rate=1)
-
-    if distributed:
-        test_sampler = DistributedSampler(test_dataset)
+            sampler=train_sampler)
     else:
-        test_sampler = None
+        trainloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=config.TRAIN.BATCH_SIZE_PER_GPU * len(gpus),
+            num_workers=config.TRAIN.WORKERS_PER_GPU * len(gpus),
+            pin_memory=True,
+            drop_last=True,
+            shuffle= True,
+            sampler=train_sampler)
 
-    testloader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=config.TEST.BATCH_SIZE_PER_GPU,
-        shuffle=False,
-        num_workers=config.WORKERS,
-        pin_memory=True,
-        sampler=test_sampler)
 
-    # criterion
-    if config.LOSS.USE_OHEM:
-        criterion = OhemCrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,
-                                     thres=config.LOSS.OHEMTHRES,
-                                     min_kept=config.LOSS.OHEMKEEP,
-                                     weight=train_dataset.class_weights)
-    else:
-        criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,
-                                 weight=train_dataset.class_weights)
+    criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,weight=torch.tensor([0,2,4,1,2,1,1,1]).float().cuda())
 
     model = FullModel(model, criterion)
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = model.to(device)
-    model = nn.parallel.DistributedDataParallel(
-        model, device_ids=[args.local_rank], output_device=args.local_rank)
+
+    if distributed:
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.local_rank], output_device=args.local_rank)
+    else:
+        model = nn.parallel.DataParallel(
+            model,device_ids=[args.local_rank] , output_device=args.local_rank
+        )
 
     # optimizer
     if config.TRAIN.OPTIMIZER == 'sgd':
@@ -217,6 +199,7 @@ def main():
                         config.TRAIN.BATCH_SIZE_PER_GPU / len(gpus))
     best_mIoU = 0
     last_epoch = 0
+
     if config.TRAIN.RESUME:
         model_state_file = os.path.join(final_output_dir,
                                         'checkpoint.pth.tar')
@@ -231,46 +214,25 @@ def main():
                         .format(checkpoint['epoch']))
 
     start = timeit.default_timer()
-    end_epoch = config.TRAIN.END_EPOCH + config.TRAIN.EXTRA_EPOCH
+    end_epoch = config.TRAIN.END_EPOCH 
     num_iters = config.TRAIN.END_EPOCH * epoch_iters
-    extra_iters = config.TRAIN.EXTRA_EPOCH * epoch_iters
+    # extra_iters = config.TRAIN.EXTRA_EPOCH * epoch_iters
     
     for epoch in range(last_epoch, end_epoch):
-        if distributed:
-            train_sampler.set_epoch(epoch)
-        if epoch >= config.TRAIN.END_EPOCH:
-            train(config, epoch-config.TRAIN.END_EPOCH, 
-                  config.TRAIN.EXTRA_EPOCH, epoch_iters, 
-                  config.TRAIN.EXTRA_LR, extra_iters, 
-                  extra_trainloader, optimizer, model, 
-                  writer_dict, device)
-        else:
-            train(config, epoch, config.TRAIN.END_EPOCH, 
-                  epoch_iters, config.TRAIN.LR, num_iters,
-                  trainloader, optimizer, model, writer_dict,
-                  device)
+        
+        train(config, epoch, config.TRAIN.END_EPOCH, 
+                epoch_iters, config.TRAIN.LR, num_iters,
+                trainloader, optimizer, model, writer_dict,
+                device)
 
-        valid_loss, mean_IoU, IoU_array = validate(config, 
-                    testloader, model, writer_dict, device)
-
-        if args.local_rank == 0:
+        if args.local_rank == 0 and (epoch+1) % 10 == 0:
             logger.info('=> saving checkpoint to {}'.format(
-                final_output_dir + 'checkpoint.pth.tar'))
+                final_output_dir + f'epoch_{epoch+1}_checkpoint.pth.tar'))
             torch.save({
                 'epoch': epoch+1,
-                'best_mIoU': best_mIoU,
                 'state_dict': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
-            }, os.path.join(final_output_dir,'checkpoint.pth.tar'))
-
-            if mean_IoU > best_mIoU:
-                best_mIoU = mean_IoU
-                torch.save(model.module.state_dict(),
-                           os.path.join(final_output_dir, 'best.pth'))
-            msg = 'Loss: {:.3f}, MeanIU: {: 4.4f}, Best_mIoU: {: 4.4f}'.format(
-                    valid_loss, mean_IoU, best_mIoU)
-            logging.info(msg)
-            logging.info(IoU_array)
+            }, os.path.join(final_output_dir, f'epoch_{epoch+1}_checkpoint.pth.tar'))
 
             if epoch == end_epoch - 1:
                 torch.save(model.module.state_dict(),
@@ -284,3 +246,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    # nn.SyncBatchNorm.convert_sync_batchnorm()

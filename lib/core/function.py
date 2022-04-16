@@ -8,6 +8,11 @@ import logging
 import os
 import time
 
+import cv2
+from matplotlib.pyplot import axes, axis
+from skimage.io import imread,imsave
+from skimage.color import label2rgb #,lab2rgb
+
 import numpy as np
 import numpy.ma as ma
 from tqdm import tqdm
@@ -16,11 +21,25 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn import functional as F
+import sys
 
-from utils.utils import AverageMeter
-from utils.utils import get_confusion_matrix
-from utils.utils import adjust_learning_rate
-from utils.utils import get_world_size, get_rank
+from lib.utils.utils import AverageMeter
+from lib.utils.utils import get_confusion_matrix
+from lib.utils.utils import adjust_learning_rate
+from lib.utils.utils import get_world_size, get_rank
+
+
+def put_palette(seg):
+        # if palette is not None:
+        palette = [[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255],
+                   [255, 0, 255], [255, 255, 0], [0, 255, 255], [100, 100, 0],
+                   [100, 0, 100], [0, 100, 100]]
+        color_seg = np.zeros((seg.shape[0], seg.shape[1], 3), dtype=np.uint8)
+        for label, color in enumerate(palette):
+            color_seg[seg == label, :] = color
+        # color_seg = color_seg[..., ::-1]
+        return color_seg
+
 
 def reduce_tensor(inp):
     """
@@ -49,11 +68,11 @@ def train(config, epoch, num_epoch, epoch_iters, base_lr, num_iters,
     rank = get_rank()
     world_size = get_world_size()
 
-    for i_iter, batch in enumerate(trainloader):
-        images, labels, _, _ = batch
+    for i_iter, results in enumerate(trainloader):
+        images= results['img']
+        labels = results['gt']
         images = images.to(device)
         labels = labels.long().to(device)
-
         losses, _ = model(images, labels)
         loss = losses.mean()
 
@@ -74,7 +93,7 @@ def train(config, epoch, num_epoch, epoch_iters, base_lr, num_iters,
                                   base_lr,
                                   num_iters,
                                   i_iter+cur_iters)
-
+        # print(f"RANK {rank}")
         if i_iter % config.PRINT_FREQ == 0 and rank == 0:
             print_loss = ave_loss.average() / world_size
             msg = 'Epoch: [{}/{}] Iter:[{}/{}], Time: {:.2f}, ' \
@@ -86,88 +105,54 @@ def train(config, epoch, num_epoch, epoch_iters, base_lr, num_iters,
             writer.add_scalar('train_loss', print_loss, global_steps)
             writer_dict['train_global_steps'] = global_steps + 1
 
-def validate(config, testloader, model, writer_dict, device):
-    
-    rank = get_rank()
-    world_size = get_world_size()
-    model.eval()
-    ave_loss = AverageMeter()
-    confusion_matrix = np.zeros(
-        (config.DATASET.NUM_CLASSES, config.DATASET.NUM_CLASSES))
-
-    with torch.no_grad():
-        for _, batch in enumerate(testloader):
-            image, label, _, _ = batch
-            size = label.size()
-            image = image.to(device)
-            label = label.long().to(device)
-
-            losses, pred = model(image, label)
-            pred = F.upsample(input=pred, size=(
-                        size[-2], size[-1]), mode='bilinear')
-            loss = losses.mean()
-            reduced_loss = reduce_tensor(loss)
-            ave_loss.update(reduced_loss.item())
-
-            confusion_matrix += get_confusion_matrix(
-                label,
-                pred,
-                size,
-                config.DATASET.NUM_CLASSES,
-                config.TRAIN.IGNORE_LABEL)
-
-    confusion_matrix = torch.from_numpy(confusion_matrix).to(device)
-    reduced_confusion_matrix = reduce_tensor(confusion_matrix)
-
-    confusion_matrix = reduced_confusion_matrix.cpu().numpy()
-    pos = confusion_matrix.sum(1)
-    res = confusion_matrix.sum(0)
-    tp = np.diag(confusion_matrix)
-    IoU_array = (tp / np.maximum(1.0, pos + res - tp))
-    mean_IoU = IoU_array.mean()
-    print_loss = ave_loss.average()/world_size
-
-    if rank == 0:
-        writer = writer_dict['writer']
-        global_steps = writer_dict['valid_global_steps']
-        writer.add_scalar('valid_loss', print_loss, global_steps)
-        writer.add_scalar('valid_mIoU', mean_IoU, global_steps)
-        writer_dict['valid_global_steps'] = global_steps + 1
-    return print_loss, mean_IoU, IoU_array
-    
 
 def testval(config, test_dataset, testloader, model, 
-        sv_dir='', sv_pred=False):
+        sv_dir='', sv_pred=True, num_classes=8,ignore_label=255):
     model.eval()
     confusion_matrix = np.zeros(
-        (config.DATASET.NUM_CLASSES, config.DATASET.NUM_CLASSES))
+        (num_classes, num_classes))
     with torch.no_grad():
-        for index, batch in enumerate(tqdm(testloader)):
-            image, label, _, name = batch
+        for index, results in enumerate(tqdm(testloader)):
+            image= results['img']
+            label = results['gt']
+            name = results['meta']['name'][0]
             size = label.size()
-            pred = test_dataset.multi_scale_inference(
-                        model, 
-                        image, 
-                        scales=config.TEST.SCALE_LIST, 
-                        flip=config.TEST.FLIP_TEST)
-            
+            _, pred = model(image, label,return_loss=False)
+            pred = F.upsample(input=pred, size=(
+                        size[-2], size[-1]), mode='bilinear')
+
             if pred.size()[-2] != size[-2] or pred.size()[-1] != size[-1]:
                 pred = F.upsample(pred, (size[-2], size[-1]), 
                                    mode='bilinear')
+            pred = F.softmax(pred,dim=1)
+            pred = torch.argmax(pred,dim=1)
+            pred = pred.cpu().detach().numpy()
+            pred = np.squeeze(pred)
+
+            label = label.cpu().detach().numpy()
+            label = np.squeeze(label)
 
             confusion_matrix += get_confusion_matrix(
                 label,
                 pred,
                 size,
-                config.DATASET.NUM_CLASSES,
-                config.TRAIN.IGNORE_LABEL)
+                num_classes,
+                ignore_label)
 
             if sv_pred:
                 sv_path = os.path.join(sv_dir,'test_val_results')
                 if not os.path.exists(sv_path):
                     os.mkdir(sv_path)
-                test_dataset.save_pred(pred, sv_path, name)
-            
+                imsave(os.path.join(sv_path,name+'.png'),np.uint8(pred))
+
+                sv_path_color = os.path.join(sv_dir,'test_val_results_color')
+                if not os.path.exists(sv_path_color):
+                    os.mkdir(sv_path_color)
+                imsave(os.path.join(sv_path,name+'.png'),pred)
+
+                pred_color = put_palette(pred)
+                imsave(os.path.join(sv_path_color,name+'.jpg'), pred_color,check_contrast=False)
+                
             if index % 100 == 0:
                 logging.info('processing: %d images' % index)
                 pos = confusion_matrix.sum(1)
@@ -184,28 +169,38 @@ def testval(config, test_dataset, testloader, model,
     mean_acc = (tp/np.maximum(1.0, pos)).mean()
     IoU_array = (tp / np.maximum(1.0, pos + res - tp))
     mean_IoU = IoU_array.mean()
-
     return mean_IoU, IoU_array, pixel_acc, mean_acc
+
 
 def test(config, test_dataset, testloader, model, 
         sv_dir='', sv_pred=True):
     model.eval()
     with torch.no_grad():
-        for _, batch in enumerate(tqdm(testloader)):
-            image, size, name = batch
-            size = size[0]
-            pred = test_dataset.multi_scale_inference(
-                        model, 
-                        image, 
-                        scales=config.TEST.SCALE_LIST, 
-                        flip=config.TEST.FLIP_TEST)
+        for _, results in enumerate(tqdm(testloader)):
+            image= results['img']
+            name = results['meta']['name'][0]
             
-            if pred.size()[-2] != size[0] or pred.size()[-1] != size[1]:
-                pred = F.upsample(pred, (size[-2], size[-1]), 
-                                   mode='bilinear')
+            _, pred = model(image, None,return_loss=False)
+            
+            if pred.shape[-2] != image.shape[-2] or pred.shape[-1] != image.shape[-1]:
+                pred = F.upsample(pred, image.shape[2:], mode='bilinear')
 
             if sv_pred:
+                pred = F.softmax(pred,1)
+                pred = torch.argmax(pred,1)
+                pred = pred.cpu().detach().numpy()
+                pred = np.squeeze(pred)
+                pred = np.uint8(pred)
+                
+                
                 sv_path = os.path.join(sv_dir,'test_results')
                 if not os.path.exists(sv_path):
                     os.mkdir(sv_path)
-                test_dataset.save_pred(pred, sv_path, name)
+
+                imsave(os.path.join(sv_path,name+'.png'),pred)
+                sv_path_color = os.path.join(sv_dir,'test_results_color')
+                if not os.path.exists(sv_path_color):
+                    os.makedirs(sv_path_color)
+                pred_color = put_palette(pred)
+                imsave(os.path.join(sv_path_color,name+'.jpg'), pred_color,check_contrast=False)
+                    

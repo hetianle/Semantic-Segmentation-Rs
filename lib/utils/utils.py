@@ -1,8 +1,3 @@
-# ------------------------------------------------------------------------------
-# Copyright (c) Microsoft
-# Licensed under the MIT License.
-# Written by Ke Sun (sunk@mail.ustc.edu.cn)
-# ------------------------------------------------------------------------------
 
 from __future__ import absolute_import
 from __future__ import division
@@ -29,11 +24,15 @@ class FullModel(nn.Module):
     super(FullModel, self).__init__()
     self.model = model
     self.loss = loss
+    # self.return_loss = return_loss
 
-  def forward(self, inputs, labels):
+  def forward(self, inputs, labels, return_loss=True):
     outputs = self.model(inputs)
-    loss = self.loss(outputs, labels)
-    return torch.unsqueeze(loss,0), outputs
+    if return_loss:
+        loss = self.loss(outputs, labels)
+        return torch.unsqueeze(loss,0), outputs
+    else:
+        return  0 , outputs
 
 def get_world_size():
     if not torch.distributed.is_initialized():
@@ -87,11 +86,11 @@ def create_logger(cfg, cfg_name, phase='train'):
         print('=> creating {}'.format(root_output_dir))
         root_output_dir.mkdir()
 
-    dataset = cfg.DATASET.DATASET
-    model = cfg.MODEL.NAME
+    # dataset = cfg.DATASET.
+    # model = cfg.MODEL.NAME
     cfg_name = os.path.basename(cfg_name).split('.')[0]
 
-    final_output_dir = root_output_dir / dataset / cfg_name
+    final_output_dir = root_output_dir / cfg_name
 
     print('=> creating {}'.format(final_output_dir))
     final_output_dir.mkdir(parents=True, exist_ok=True)
@@ -107,23 +106,25 @@ def create_logger(cfg, cfg_name, phase='train'):
     console = logging.StreamHandler()
     logging.getLogger('').addHandler(console)
 
-    tensorboard_log_dir = Path(cfg.LOG_DIR) / dataset / model / \
-            (cfg_name + '_' + time_str)
+    _tblog = 'tensorboard_log'
+    tensorboard_log_dir = final_output_dir / _tblog
+
     print('=> creating {}'.format(tensorboard_log_dir))
     tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
 
     return logger, str(final_output_dir), str(tensorboard_log_dir)
 
-def get_confusion_matrix(label, pred, size, num_class, ignore=-1):
+def get_confusion_matrix(seg_gt, seg_pred, size, num_class, ignore=-1):
     """
     Calcute the confusion matrix by given label and pred
     """
-    output = pred.cpu().numpy().transpose(0, 2, 3, 1)
-    seg_pred = np.asarray(np.argmax(output, axis=3), dtype=np.uint8)
-    seg_gt = np.asarray(
-    label.cpu().numpy()[:, :size[-2], :size[-1]], dtype=np.int)
+    # output = pred.cpu().numpy().transpose(0, 2, 3, 1)
+    # seg_pred = np.asarray(np.argmax(output, axis=3), dtype=np.uint8)
+    # seg_gt = np.asarray(
+    # label.cpu().numpy()[:, :size[-2], :size[-1]], dtype=np.int)
 
     ignore_index = seg_gt != ignore
+
     seg_gt = seg_gt[ignore_index]
     seg_pred = seg_pred[ignore_index]
 
